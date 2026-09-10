@@ -165,7 +165,6 @@ FLASHINFER_MOE_EP_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",
-        "DeepseekV41ForCausalLM",
     }
 )
 
