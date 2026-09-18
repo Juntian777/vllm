@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, ClassVar, cast
 
 import torch
@@ -793,6 +795,40 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         end = num_decode_tokens + num_prefill_tokens
         return self.left_visible[:end], self.right_visible[:end]
+
+    def build_dflash_metadata_refresh(
+        self, metadata: DeepseekSparseSWAMetadata, num_query_per_req: int
+    ) -> Callable[[], None] | None:
+        if (
+            not current_platform.is_cuda()
+            or not self.is_dspark
+            or metadata.num_prefills
+            or metadata.decode_swa_width != self.noncausal_index_width
+        ):
+            return None
+        # Private to this graph: eager builds overwrite the builder's mapping.
+        metadata.token_to_req_indices = (
+            torch.arange(
+                metadata.num_decode_tokens, dtype=torch.int32, device=self.device
+            )
+            // num_query_per_req
+        )
+        return partial(
+            _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL,
+            metadata.decode_swa_indices,
+            metadata.decode_swa_lens,
+            self.window_size,
+            self.noncausal_index_width,
+            metadata.query_start_loc,
+            metadata.seq_lens,
+            metadata.token_to_req_indices,
+            metadata.is_valid_token,
+            metadata.slot_mapping,
+            metadata.block_table,
+            self.block_size,
+            num_tokens=metadata.num_decode_tokens,
+            token_offset=0,
+        )
 
     def update_draft_decode_metadata(
         self,

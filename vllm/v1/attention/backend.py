@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar
@@ -712,6 +713,16 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
             common_attn_metadata=common_attn_metadata,
             fast_build=True,
         )
+
+    def build_dflash_metadata_refresh(
+        self, metadata: M, num_query_per_req: int
+    ) -> Callable[[], None] | None:
+        """Return a capture-safe refresh for uniform DFlash queries, if supported.
+
+        The refresh must update all step-dependent buffers from persistent input
+        buffers, allowing FULL replay to skip the eager metadata build.
+        """
+        return None
 
     def update_draft_decode_metadata(self, metadata: M) -> None:
         """Update step-dependent draft decode metadata in place.
