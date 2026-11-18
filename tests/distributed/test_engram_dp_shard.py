@@ -323,7 +323,14 @@ def _check_pool_tables(store_dir: str):
         group = PeerGroup(WORLD_SIZE, f"{store_dir}/{transport}{host}{node}/store")
         # Engines batch differently (P/D): owners size each requester's mailbox.
         max_items = 9 * len(HEAD_SIZES) * (1 + group.rank_in_group % 2)
-        pool = EngramPool(group, transport, host, max_items, 72)
+        pool = EngramPool(
+            group,
+            transport,
+            host and transport == "rdma",
+            max_items,
+            72,
+            egm=host and transport == "nvlink",
+        )
         if node == 1:
             pool.transport.node = str(group.rank_in_group)  # type: ignore[attr-defined]
         with torch.device("cuda"):
@@ -1227,3 +1234,91 @@ def test_engram_hash_padding_ignores_other_nodes(tp_size, uniform, monkeypatch):
         torch.testing.assert_close(
             gathered, expected.repeat(group_size, 1, 1), msg=f"DP rank {dp_rank}"
         )
+
+
+@pytest.mark.parametrize(
+    "failure", ["numa", "allocate", "export", "import", "map", "timeout"]
+)
+def test_egm_startup_failure_propagates(monkeypatch, failure: str) -> None:
+    """A rank-local EGM failure reaches both ranks and frees local allocations."""
+    import threading
+
+    from vllm.distributed.engram_pool import nvlink
+
+    local = threading.local()
+    barrier = threading.Barrier(2, timeout=5)
+    values = [b"", b""]
+    allocated = []
+
+    class Group:
+        def __init__(self, rank):
+            self.rank_in_group = rank
+
+        def all_gather(self, value):
+            if failure == "timeout" and value == b"":
+                raise TimeoutError("injected mapping status timeout")
+            values[self.rank_in_group] = value
+            barrier.wait()
+            result = values.copy()
+            barrier.wait()
+            return result
+
+    class Memory:
+        def __init__(self, *args, **kwargs):
+            if failure == "allocate" and local.rank == 0:
+                raise RuntimeError("injected allocation failure")
+            self.rank = local.rank
+            self.handle = f"allocation-{self.rank}"
+            self.mapped = []
+            self.released = []
+            allocated.append(self)
+
+        def export_fabric(self):
+            if failure == "export" and self.rank == 0:
+                raise RuntimeError("injected export failure")
+            return str(self.rank).encode()
+
+        def import_fabric(self, handle):
+            if failure == "import" and self.rank == 0:
+                raise RuntimeError("injected import failure")
+            return handle
+
+        def map(self, handle=None, **kwargs):
+            if failure == "map" and self.rank == 0 and handle is not None:
+                raise RuntimeError("injected map failure")
+            address = (self.rank, handle)
+            self.mapped.append(address)
+            return address
+
+        def unmap(self, address):
+            self.mapped.remove(address)
+
+        def release(self, handle):
+            self.released.append(handle)
+
+    def numa():
+        return -1 if failure == "numa" and local.rank == 0 else 0
+
+    monkeypatch.setattr(nvlink, "CuMem", Memory)
+    monkeypatch.setattr(nvlink, "gpu_numa_node", numa)
+    monkeypatch.setattr(
+        nvlink.torch,
+        "tensor",
+        lambda *args, **kwargs: SimpleNamespace(data_ptr=lambda: 0),
+    )
+    monkeypatch.setattr(nvlink, "device_view", lambda *args: None)
+
+    def run(rank):
+        local.rank = rank
+        error = (
+            pytest.raises(TimeoutError, match="mapping status timeout")
+            if failure == "timeout"
+            else pytest.raises(RuntimeError, match="rank 0")
+        )
+        with error:
+            nvlink.NvlinkTransport(Group(rank), True).shard(8, "test")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(run, range(2)))
+    assert all(not memory.mapped for memory in allocated)
+    assert all(memory.handle in memory.released for memory in allocated)

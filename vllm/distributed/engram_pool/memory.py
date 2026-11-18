@@ -149,7 +149,11 @@ class CuMem:
         """Map `handle` (this allocation by default) for this GPU."""
         cu = self.cu
         address = int(self.call(cu.cuMemAddressReserve, self.size, 0, 0, 0))
-        self.call(cu.cuMemMap, address, self.size, 0, handle or self.handle, 0)
+        try:
+            self.call(cu.cuMemMap, address, self.size, 0, handle or self.handle, 0)
+        except RuntimeError:
+            self.call(cu.cuMemAddressFree, address, self.size)
+            raise
         access = cu.CUmemAccessDesc()
         access.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         access.location.id = torch.accelerator.current_device_index()
@@ -158,8 +162,16 @@ class CuMem:
             if read_only
             else cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
         )
-        self.call(cu.cuMemSetAccess, address, self.size, [access], 1)
+        try:
+            self.call(cu.cuMemSetAccess, address, self.size, [access], 1)
+        except RuntimeError:
+            self.unmap(address)
+            raise
         return address
+
+    def unmap(self, address: int) -> None:
+        self.call(self.cu.cuMemUnmap, address, self.size)
+        self.call(self.cu.cuMemAddressFree, address, self.size)
 
     def import_fabric(self, exported: bytes):
         fabric = self.cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
