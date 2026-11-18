@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen4Exp n-gram embeddings with device, pinned-host and disk storage."""
+"""Qwen4Exp n-gram embeddings with device, host, disk and peer storage."""
 
 import mmap
 import os
@@ -12,6 +12,7 @@ from transformers import Qwen4ExpTextConfig
 
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_engram_dp_group, get_etp_group, get_tp_group
+from vllm.distributed.engram_pool import EngramTable, get_engram_pool
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -262,6 +263,54 @@ class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
         raise RuntimeError("PLE disk offload does not support prefetch")
 
 
+class Qwen4ExpPLEPoolEmbedding(Qwen4ExpPLEDeviceEmbedding):
+    """Serve FP8 PLE rows from shards split over an NVLink peer group."""
+
+    def __init__(
+        self,
+        *args,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        num_ngram_heads: int,
+        max_total_tokens: int,
+        **kwargs,
+    ) -> None:
+        if not isinstance(embedding_method, Qwen4ExpPLEFp8EmbeddingMethod):
+            raise ValueError("Qwen4Exp NVLink Engram pool requires an FP8 PLE table")
+        self._max_items = max_total_tokens * num_ngram_heads
+        self.table: EngramTable | None = None
+        super().__init__(*args, embedding_method=embedding_method, **kwargs)
+        if self.table is not None:
+            start = self.table.row_start
+            end = start + self.table.shard.shape[0]
+            self.shard_indices.org_vocab_start_index = start
+            self.shard_indices.org_vocab_end_index = end
+            self.shard_indices.padded_org_vocab_start_index = start
+            self.shard_indices.padded_org_vocab_end_index = end
+            self.num_org_embeddings_per_partition = end - start
+
+    def allocate_embedding_weight(
+        self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if torch.get_default_device().type == "meta":
+            return torch.empty(num_embeddings, embedding_dim, dtype=dtype)
+        config = get_current_vllm_config().model_config
+        assert config is not None
+        self.pool = get_engram_pool(self._max_items, embedding_dim)
+        name = f"{config.model}@{config.revision}:{self.prefix}"
+        self.table = self.pool.table(num_embeddings, embedding_dim, name)
+        return self.table.shard.view(dtype)
+
+    def process_weights_after_loading(self) -> None:
+        if self.table is None or self.weight.data_ptr() != self.table.shard.data_ptr():
+            raise RuntimeError("Qwen4Exp PLE weight must alias its Engram pool shard")
+        self.pool.ready(self.table)
+
+    def forward(self, ngram_ids: torch.Tensor) -> torch.Tensor:
+        assert self.table is not None
+        rows = self.pool.lookup([self.table], ngram_ids.unsqueeze(-2))[0]
+        return rows[..., : self.embedding_dim].view(self.weight.dtype)
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -433,7 +482,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
         embedding_cls = (
-            Qwen4ExpPLEDiskOffloadEmbedding
+            Qwen4ExpPLEPoolEmbedding
+            if engram_config is not None and engram_config.peer_group_size
+            else Qwen4ExpPLEDiskOffloadEmbedding
             if engram_config is not None and engram_config.disk_offload
             else Qwen4ExpPLESharedHostEmbedding
             if engram_config is not None

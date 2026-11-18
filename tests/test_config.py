@@ -2204,6 +2204,7 @@ _PEER_GROUP = {
         (_PEER_GROUP | {"cpu_offload": True, "peer_group_transport": "rdma"}, {}, None),
         (_PEER_GROUP, {"tensor_parallel_size": 2}, "TP=1"),
         (_PEER_GROUP, {"pipeline_parallel_size": 2}, "PP=1"),
+        (_PEER_GROUP, {"enable_dbo": True}, "DBO"),
         (_PEER_GROUP, {"data_parallel_size": 8}, "cannot hold an engine of 8"),
         (_PEER_GROUP, {"data_parallel_size": 4}, None),
     ],
@@ -2219,14 +2220,40 @@ def test_engram_peer_group_validation(options, parallel, error, monkeypatch):
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
-    "architecture,layer_field,supported",
+    "architecture,layer_field,options,error",
     [
-        ("DeepseekV41ForCausalLM", "engram_layer_ids", True),
-        ("Qwen4ExpForCausalLM", "ple_layer_ids", False),
+        ("DeepseekV41ForCausalLM", "engram_layer_ids", {}, None),
+        ("Qwen4ExpForConditionalGeneration", "ple_layer_ids", {}, None),
+        (
+            "Qwen4ExpForConditionalGeneration",
+            "ple_layer_ids",
+            {"peer_group_transport": "rdma"},
+            "peer_group_transport",
+        ),
+        (
+            "Qwen4ExpForCausalLM",
+            "ple_layer_ids",
+            {"peer_group_fetch": "async"},
+            "peer_group_fetch",
+        ),
+        (
+            "Qwen4ExpForCausalLM",
+            "ple_layer_ids",
+            {"embedding_across_dp": True},
+            "embedding_across_dp",
+        ),
+        (
+            "Qwen4ExpForCausalLM",
+            "ple_layer_ids",
+            {"disk_offload": True},
+            "incompatible with disk_offload",
+        ),
     ],
 )
-def test_engram_peer_group_requires_pool_support(architecture, layer_field, supported):
-    """Qwen4Exp's tables ignore peer groups, so they would not be split."""
+def test_engram_peer_group_model_options(
+    architecture, layer_field, options, error, monkeypatch
+):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     model = cast(
         ModelConfig,
         SimpleNamespace(
@@ -2234,9 +2261,8 @@ def test_engram_peer_group_requires_pool_support(architecture, layer_field, supp
             hf_text_config=SimpleNamespace(**{layer_field: [1]}),
         ),
     )
-    config = EngramConfig(**_PEER_GROUP)
-    rejects = pytest.raises(ValueError, match="pool support")
-    with nullcontext() if supported else rejects:
+    config = EngramConfig(**(_PEER_GROUP | options))
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
         config.verify_model_config(model)
 
 

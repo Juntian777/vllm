@@ -15,7 +15,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
-from transformers import Qwen4ExpTextConfig
+from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
@@ -23,9 +23,20 @@ import vllm.models.qwen4_exp.common.ngram_embedding as ngram_embedding_module
 import vllm.models.qwen4_exp.nvidia.ngram_embedding as nvidia_ngram_embedding_module
 import vllm.utils.gpu_sync_debug as gpu_sync_debug
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
-from vllm.config import SpeculativeConfig, VllmConfig
+from vllm.config import (
+    EngramConfig,
+    ModelConfig,
+    SpeculativeConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.quantization import QuantizationConfigArgs
+from vllm.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointExporter,
     MambaPrefillCheckpointMetadata,
@@ -55,10 +66,12 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEDiskOffloadEmbedding,
+    Qwen4ExpPLEEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLENvFp4EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
+    Qwen4ExpPLEPoolEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
     stage_checkpoint_rows,
 )
@@ -66,6 +79,7 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import with_gpu_sync_check
 from vllm.utils.torch_utils import weak_ref_tensor
+from vllm.utils.vmm_driver import imex_channel_available
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
     PleShortConvAttentionMetadataBuilder,
@@ -1123,8 +1137,8 @@ def test_ple_fp8_embedding_supports_mixed_precision_config(
     )
 
 
-def _save_ple_checkpoint(path: Path, fmt: str) -> None:
-    """Save a 24-row, 32-wide PLE table as four checkpoint shards of 6 rows."""
+def _save_ple_checkpoint(path: Path, fmt: str, parts: int = 4) -> None:
+    """Save a 24-row, 32-wide PLE table split into checkpoint shards."""
     tensors: dict[str, torch.Tensor] = {}
     if fmt == "nvfp4":
         planes = {
@@ -1141,7 +1155,7 @@ def _save_ple_checkpoint(path: Path, fmt: str) -> None:
             planes = {"weight": values.to(torch.float8_e4m3fn)}
             tensors["ngram_embedding.weight_scale"] = torch.tensor([0.25])
     for name, table in planes.items():
-        for index, shard in enumerate(table.split(6)):
+        for index, shard in enumerate(table.chunk(parts)):
             tensors[f"ngram_embedding.shard_{index}.{name}"] = shard.clone()
     save_file(tensors, path)
 
@@ -1164,7 +1178,10 @@ def _make_ple_from_checkpoint(
     vllm_config = SimpleNamespace(
         load_config=SimpleNamespace(load_format="auto"),
         engram_config=SimpleNamespace(
-            disk_offload=disk_offload, cpu_offload=False, dp_shared_memory=False
+            disk_offload=disk_offload,
+            cpu_offload=False,
+            dp_shared_memory=False,
+            peer_group_size=0,
         ),
     )
     for name, value in (
@@ -1202,6 +1219,122 @@ def _make_ple_from_checkpoint(
         embedding = module.ngram_embedding
         embedding.quant_method.process_weights_after_loading(embedding)
     return module
+
+
+def _check_nvlink_ple(rank: int, path: Path, store: str) -> None:
+    torch.accelerator.set_device_index(rank)
+    model_config = ModelConfig(
+        model=str(path.parent), dtype="bfloat16", skip_tokenizer_init=True
+    )
+    config = VllmConfig(
+        model_config=model_config,
+        engram_config=EngramConfig(
+            peer_group_size=2,
+            peer_group_store=store,
+            cpu_offload=False,
+        ),
+    )
+
+    def load(config: VllmConfig) -> Qwen4ExpPLEEmbedding:
+        with set_current_vllm_config(config):
+            with torch.device(f"cuda:{rank}"):
+                module = Qwen4ExpNGramEmbedding(
+                    model_config.hf_text_config,
+                    64,
+                    0,
+                    8,
+                    data_parallel_rank=0,
+                    prefix="t",
+                    params_dtype=torch.bfloat16,
+                )
+            with safe_open(path, framework="pt") as checkpoint:
+                module.load_weights(
+                    (name, checkpoint.get_tensor(name))
+                    for name in checkpoint.keys()  # noqa: SIM118
+                )
+            embedding = module.ngram_embedding
+            embedding.quant_method.process_weights_after_loading(embedding)
+            if isinstance(embedding, Qwen4ExpPLEPoolEmbedding):
+                embedding.process_weights_after_loading()
+            return embedding
+
+    try:
+        with set_current_vllm_config(config):
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=rank,
+                distributed_init_method=f"file://{path.parent}/world-{rank}",
+                backend="nccl",
+            )
+            initialize_model_parallel(tensor_model_parallel_size=1)
+        embedding = load(config)
+        reference = load(
+            VllmConfig(
+                model_config=model_config,
+                engram_config=EngramConfig(cpu_offload=False),
+            )
+        )
+        assert isinstance(embedding, Qwen4ExpPLEPoolEmbedding)
+        assert embedding.table is not None
+        assert embedding.weight.shape == (12, 32)
+        start = embedding.table.row_start
+        assert torch.equal(
+            embedding.weight.view(torch.uint8),
+            reference.weight[start : start + 12].view(torch.uint8),
+        )
+        ids = torch.tensor([[0, 11], [12, 23]], dtype=torch.long, device="cuda")
+        embedding(ids)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = embedding(ids)
+        for rows in ([[12, 12], [11, 0]], [[23, 11], [0, 12]]):
+            ids.copy_(torch.tensor(rows, device="cuda"))
+            graph.replay()
+            expected = reference(ids)
+            assert torch.equal(output.view(torch.uint8), expected.view(torch.uint8))
+            torch.testing.assert_close(
+                embedding.dequantize(output, torch.bfloat16),
+                reference.dequantize(expected, torch.bfloat16),
+                atol=0,
+                rtol=0,
+            )
+        embedding.pool.group.barrier()
+    finally:
+        cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or torch.accelerator.device_count() < 2,
+    reason="requires two CUDA GPUs",
+)
+def test_nvlink_ple_checkpoint_shards_and_cuda_graph(tmp_path: Path) -> None:
+    if not imex_channel_available():
+        pytest.skip("requires CUDA FABRIC handles")
+    text_config = Qwen4ExpTextConfig(
+        vocab_size=64,
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=64,
+        ngram_size=2,
+        heads_per_ngram=2,
+        eos_token_id=0,
+        split_ngram_parts=3,
+        ngram_vocab_size_base=8,
+        make_ngram_vocab_size_divisible_by=1,
+        ple_layer_ids=[1],
+    )
+    text_config.ple_embedding_dtype = "float8_e4m3fn"
+    Qwen4ExpConfig(
+        text_config=text_config, architectures=["Qwen4ExpForConditionalGeneration"]
+    ).save_pretrained(tmp_path)
+    path = tmp_path / "model.safetensors"
+    _save_ple_checkpoint(path, "fp8", parts=3)
+    torch.multiprocessing.spawn(
+        _check_nvlink_ple, args=(path, str(tmp_path / "peers")), nprocs=2
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="disk offload is CUDA-only")
