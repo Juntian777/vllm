@@ -13,7 +13,6 @@ from transformers import Qwen4ExpTextConfig
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_engram_dp_group, get_etp_group, get_tp_group
 from vllm.distributed.engram_pool import EngramTable, get_engram_pool
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -23,7 +22,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter, sp_shard
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import round_up
-from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..common.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
@@ -281,14 +279,9 @@ class Qwen4ExpPLEPoolEmbedding(Qwen4ExpPLEDeviceEmbedding):
         self._max_items = max_total_tokens * num_ngram_heads
         self.table: EngramTable | None = None
         super().__init__(*args, embedding_method=embedding_method, **kwargs)
-        config = get_current_vllm_config()
-        assert config.engram_config is not None
-        self._rdma = config.engram_config.peer_group_transport == "rdma"
-        if self._rdma:
-            layers = config.compilation_config.static_forward_context
-            if self.prefix in layers:
-                raise ValueError(f"Duplicate layer name: {self.prefix}")
-            layers[self.prefix] = self
+        engram_config = get_current_vllm_config().engram_config
+        assert engram_config is not None
+        self._rdma = engram_config.peer_group_transport == "rdma"
         if self.table is not None:
             start = self.table.row_start
             end = start + self.table.shard.shape[0]
@@ -321,26 +314,12 @@ class Qwen4ExpPLEPoolEmbedding(Qwen4ExpPLEDeviceEmbedding):
             rows = ngram_ids.new_empty(
                 (*ngram_ids.shape, self.table.row_stride), dtype=torch.uint8
             )
-            torch.ops.vllm.qwen4_exp_ple_rdma_lookup(ngram_ids, rows, self.prefix)
+            self.pool.lookup(
+                [self.table], ngram_ids.unsqueeze(-2), out=rows.unsqueeze(0)
+            )
         else:
             rows = self.pool.lookup([self.table], ngram_ids.unsqueeze(-2))[0]
         return rows[..., : self.embedding_dim].view(self.weight.dtype)
-
-
-def _ple_rdma_lookup(
-    ngram_ids: torch.Tensor, out: torch.Tensor, layer_name: str
-) -> None:
-    """Keep RDMA's device addresses and NIC queue state outside Dynamo."""
-    layer = get_forward_context().no_compile_layers[layer_name]
-    assert isinstance(layer, Qwen4ExpPLEPoolEmbedding) and layer.table is not None
-    layer.pool.lookup([layer.table], ngram_ids.unsqueeze(-2), out=out.unsqueeze(0))
-
-
-direct_register_custom_op(
-    op_name="qwen4_exp_ple_rdma_lookup",
-    op_func=_ple_rdma_lookup,
-    mutates_args=["out"],
-)
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):

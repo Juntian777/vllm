@@ -38,7 +38,6 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointExporter,
     MambaPrefillCheckpointMetadata,
@@ -1287,25 +1286,21 @@ def _check_pool_ple(rank: int, path: Path, store: str, transport, host: bool) ->
             reference.weight[start : start + 12].view(torch.uint8),
         )
         ids = torch.tensor([[0, 11], [12, 23]], dtype=torch.long, device="cuda")
-        lookup = embedding
-        if transport == "rdma":
-            lookup = torch.compile(embedding, backend="eager", fullgraph=True)
-        with set_forward_context(None, config):
-            lookup(ids)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                output = lookup(ids)
-            for rows in ([[12, 12], [11, 0]], [[23, 11], [0, 12]]):
-                ids.copy_(torch.tensor(rows, device="cuda"))
-                graph.replay()
-                expected = reference(ids)
-                assert torch.equal(output.view(torch.uint8), expected.view(torch.uint8))
-                torch.testing.assert_close(
-                    embedding.dequantize(output, torch.bfloat16),
-                    reference.dequantize(expected, torch.bfloat16),
-                    atol=0,
-                    rtol=0,
-                )
+        embedding(ids)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = embedding(ids)
+        for rows in ([[12, 12], [11, 0]], [[23, 11], [0, 12]]):
+            ids.copy_(torch.tensor(rows, device="cuda"))
+            graph.replay()
+            expected = reference(ids)
+            assert torch.equal(output.view(torch.uint8), expected.view(torch.uint8))
+            torch.testing.assert_close(
+                embedding.dequantize(output, torch.bfloat16),
+                reference.dequantize(expected, torch.bfloat16),
+                atol=0,
+                rtol=0,
+            )
         embedding.pool.group.barrier()
     finally:
         cleanup_dist_env_and_memory()
