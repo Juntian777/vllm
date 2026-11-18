@@ -278,10 +278,8 @@ class Qwen4ExpPLEPoolEmbedding(Qwen4ExpPLEDeviceEmbedding):
             raise ValueError("Qwen4Exp Engram pool requires an FP8 PLE table")
         self._max_items = max_total_tokens * num_ngram_heads
         self.table: EngramTable | None = None
+        self._loaded_ranges: list[tuple[int, int]] = []
         super().__init__(*args, embedding_method=embedding_method, **kwargs)
-        engram_config = get_current_vllm_config().engram_config
-        assert engram_config is not None
-        self._rdma = engram_config.peer_group_transport == "rdma"
         if self.table is not None:
             start = self.table.row_start
             end = start + self.table.shard.shape[0]
@@ -290,35 +288,46 @@ class Qwen4ExpPLEPoolEmbedding(Qwen4ExpPLEDeviceEmbedding):
             self.shard_indices.padded_org_vocab_start_index = start
             self.shard_indices.padded_org_vocab_end_index = end
             self.num_org_embeddings_per_partition = end - start
+            if get_current_vllm_config().load_config.load_format == "dummy":
+                self._loaded_ranges.append((start, end))
 
     def allocate_embedding_weight(
         self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
     ) -> torch.Tensor:
         if torch.get_default_device().type == "meta":
             return torch.empty(num_embeddings, embedding_dim, dtype=dtype)
-        config = get_current_vllm_config().model_config
-        assert config is not None
         self.pool = get_engram_pool(self._max_items, embedding_dim)
-        name = f"{config.model}@{config.revision}:{self.prefix}"
-        self.table = self.pool.table(num_embeddings, embedding_dim, name)
+        self.table = self.pool.table(num_embeddings, embedding_dim, self.prefix)
         return self.table.shard.view(dtype)
 
     def process_weights_after_loading(self) -> None:
         if self.table is None or self.weight.data_ptr() != self.table.shard.data_ptr():
             raise RuntimeError("Qwen4Exp PLE weight must alias its Engram pool shard")
+        start = self.table.row_start
+        end = start + self.table.shard.shape[0]
+        cursor, error = start, ""
+        for first, last in sorted(self._loaded_ranges):
+            if first != cursor:
+                error = f"missing or overlapping PLE rows at {cursor}"
+                break
+            cursor = last
+        if not error and cursor != end:
+            error = f"PLE rows covered through {cursor}, expected {end}"
+        errors = self.pool.group.all_gather(error.encode())
+        if any(errors):
+            raise RuntimeError(f"Engram pool PLE checkpoint coverage failed: {errors}")
         self.pool.ready(self.table)
+
+    def record_checkpoint_rows(self, start: int, end: int) -> None:
+        assert self.table is not None
+        first = max(start, self.table.row_start)
+        last = min(end, self.table.row_start + self.table.shard.shape[0])
+        if first < last:
+            self._loaded_ranges.append((first, last))
 
     def forward(self, ngram_ids: torch.Tensor) -> torch.Tensor:
         assert self.table is not None
-        if self._rdma:
-            rows = ngram_ids.new_empty(
-                (*ngram_ids.shape, self.table.row_stride), dtype=torch.uint8
-            )
-            self.pool.lookup(
-                [self.table], ngram_ids.unsqueeze(-2), out=rows.unsqueeze(0)
-            )
-        else:
-            rows = self.pool.lookup([self.table], ngram_ids.unsqueeze(-2))[0]
+        rows = self.pool.lookup([self.table], ngram_ids.unsqueeze(-2))[0]
         return rows[..., : self.embedding_dim].view(self.weight.dtype)
 
 
@@ -780,6 +789,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         loaded_weight,
                         checkpoint_start=checkpoint_start,
                     )
+                    if isinstance(embedding, Qwen4ExpPLEPoolEmbedding):
+                        embedding.record_checkpoint_rows(
+                            checkpoint_start, checkpoint_start + expected_rows
+                        )
                 loaded.add(f"ngram_embedding.{suffix}")
                 continue
             if nvfp4_method is not None and name in (
@@ -794,6 +807,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+            if isinstance(embedding, Qwen4ExpPLEPoolEmbedding):
+                for name, _ in regular_weights:
+                    if name == "ngram_embedding.weight":
+                        embedding.record_checkpoint_rows(0, embedding.org_vocab_size)
+        if isinstance(embedding, Qwen4ExpPLEPoolEmbedding):
+            # Coverage is checked collectively in the pool's post-load hook.
+            loaded.add("ngram_embedding.weight")
         return loaded
 
 

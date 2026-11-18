@@ -2204,7 +2204,6 @@ _PEER_GROUP = {
         (_PEER_GROUP | {"cpu_offload": True, "peer_group_transport": "rdma"}, {}, None),
         (_PEER_GROUP, {"tensor_parallel_size": 2}, "TP=1"),
         (_PEER_GROUP, {"pipeline_parallel_size": 2}, "PP=1"),
-        (_PEER_GROUP, {"enable_dbo": True}, "DBO"),
         (_PEER_GROUP, {"data_parallel_size": 8}, "cannot hold an engine of 8"),
         (_PEER_GROUP, {"data_parallel_size": 4}, None),
     ],
@@ -2270,6 +2269,36 @@ def test_engram_peer_group_model_options(
     config = EngramConfig(**(_PEER_GROUP | options))
     with pytest.raises(ValueError, match=error) if error else nullcontext():
         config.verify_model_config(model)
+
+
+@pytest.mark.parametrize(
+    "parallel,load_format,transfer,error",
+    [
+        ({"enable_dbo": True}, "auto", None, "DBO"),
+        ({}, "ipc_cache", None, "ipc_cache"),
+        ({}, "auto", True, "weight transfer"),
+    ],
+)
+def test_qwen_ple_pool_rejects_unsupported_engine_options(
+    monkeypatch, parallel, load_format, transfer, error
+):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                architecture="Qwen4ExpForConditionalGeneration",
+                hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+            ),
+            speculative_config=None,
+            engram_config=EngramConfig(**_PEER_GROUP),
+            parallel_config=ParallelConfig(**parallel),
+            load_config=SimpleNamespace(load_format=load_format),
+            weight_transfer_config=transfer,
+        ),
+    )
+    with pytest.raises(ValueError, match=error):
+        VllmConfig._resolve_and_verify_engram_config(config)
 
 
 @pytest.mark.skip_global_cleanup

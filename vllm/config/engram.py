@@ -203,8 +203,6 @@ class EngramConfig:
                     f"An Engram peer group of {self.peer_group_size} GPUs cannot "
                     f"hold an engine of {parallel_config.data_parallel_size}"
                 )
-            if parallel_config.use_ubatching:
-                raise ValueError("Engram pool does not support DBO or microbatching")
 
     def get_parallel_size(self, parallel_config: "ParallelConfig") -> int:
         """Derive the embedding group size from the parallel configuration."""

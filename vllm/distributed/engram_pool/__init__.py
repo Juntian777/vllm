@@ -78,21 +78,13 @@ class Landed(NamedTuple):
 class EngramFetch:
     """A started fetch: `wait(i)` places table i's rows, `landed(i)` finds them."""
 
-    def __init__(
-        self,
-        pool: "EngramPool",
-        shape: tuple[int, ...],
-        out: torch.Tensor | None = None,
-    ) -> None:
+    def __init__(self, pool: "EngramPool", shape: tuple[int, ...]) -> None:
         self.pool, self.shape, self.row_stride = pool, shape, shape[-1]
-        self._out = out
         self.state: Any = None
 
     @cached_property
     def rows(self) -> torch.Tensor:
         """Placed rows, `[L, ..., K, row_stride]` uint8."""
-        if self._out is not None:
-            return self._out
         return self.pool._output(math.prod(self.shape)).view(self.shape)
 
     def wait(self, index: int) -> torch.Tensor:
@@ -236,44 +228,22 @@ class EngramPool:
             self._buffer = torch.empty(numel_max, dtype=torch.uint8, device="cuda")
         return self._buffer[:numel]
 
-    def start(
-        self,
-        tables: list[EngramTable],
-        ids: torch.Tensor,
-        *,
-        out: torch.Tensor | None = None,
-    ) -> EngramFetch:
+    def start(self, tables: list[EngramTable], ids: torch.Tensor) -> EngramFetch:
         """Start fetching `ids` (`[..., L, K]`: rows of table l at `[..., l, :]`)
-        on the current stream; ids < 0 or past a table give zero rows.
-
-        If supplied, `out` holds the placed rows as contiguous CUDA uint8.
-        """
+        on the current stream; ids < 0 or past a table give zero rows."""
         if ids.shape[-2] != len(tables):
             raise ValueError(
                 f"ids {tuple(ids.shape)} do not match {len(tables)} tables"
             )
         meta = self._meta(tables)
         shape = (len(tables), *ids.shape[:-2], ids.shape[-1], tables[0].row_stride)
-        if out is not None and (
-            out.shape != shape
-            or out.dtype != torch.uint8
-            or out.device != ids.device
-            or not out.is_contiguous()
-        ):
-            raise ValueError(f"Engram pool output must be contiguous uint8 of {shape}")
-        fetch = EngramFetch(self, shape, out)
+        fetch = EngramFetch(self, shape)
         fetch.state = self.transport.start(meta, ids.contiguous(), fetch)
         return fetch
 
-    def lookup(
-        self,
-        tables: list[EngramTable],
-        ids: torch.Tensor,
-        *,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def lookup(self, tables: list[EngramTable], ids: torch.Tensor) -> torch.Tensor:
         """Rows `[L, ..., K, row_stride]` (uint8) of `ids`, as `start` takes."""
-        fetch = self.start(tables, ids, out=out)
+        fetch = self.start(tables, ids)
         for index in range(len(tables)):
             fetch.wait(index)
         return fetch.rows
