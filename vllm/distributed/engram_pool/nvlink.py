@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Peer HBM over NVLink: every GPU maps every shard (cuMem FABRIC handles), so
+"""Peer HBM or EGM over NVLink: every GPU maps each shard (cuMem FABRIC), so
 a fetch is one kernel that loads each row from its owner's memory."""
 
 import torch
 
-from vllm.distributed.engram_pool.memory import CuMem, device_view
+from vllm.distributed.engram_pool.memory import CuMem, device_view, gpu_numa_node
 from vllm.distributed.engram_pool.rows import SHARD_BASES, locate
 from vllm.triton_utils import tl, triton
 
@@ -42,13 +42,16 @@ def _gather_kernel(
 class NvlinkTransport:
     """`group` provides rank_in_group and all_gather(bytes)."""
 
-    def __init__(self, group) -> None:
+    def __init__(self, group, host_shards: bool) -> None:
         self.group = group
+        self.host_numa = gpu_numa_node() if host_shards else None
+        if self.host_numa is not None and self.host_numa < 0:
+            raise RuntimeError("NVLink Engram EGM shards require a CUDA host NUMA node")
 
     def shard(self, num_bytes: int, name: str) -> tuple[torch.Tensor, list, list]:
         """Allocate this GPU's shard and map every GPU's. Returns the shard, its
         `meta` arrays (shard addresses) and what keeps them alive. Collective."""
-        memory = CuMem(num_bytes, fabric=True)
+        memory = CuMem(num_bytes, fabric=True, host_numa=self.host_numa)
         exported = self.group.all_gather(memory.export_fabric())
         addresses = []
         for rank, handle in enumerate(exported):
@@ -56,7 +59,7 @@ class NvlinkTransport:
                 addresses.append(memory.map())
                 continue
             imported = memory.import_fabric(handle)
-            addresses.append(memory.map(imported))
+            addresses.append(memory.map(imported, read_only=self.host_numa is not None))
             memory.release(imported)
         own = addresses[self.group.rank_in_group]
         bases = torch.tensor(addresses, dtype=torch.int64, device="cuda")

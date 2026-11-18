@@ -36,6 +36,7 @@ from vllm.config.scheduler import SchedulerConfig
 from vllm.distributed import cleanup_dist_env_and_memory, parallel_state
 from vllm.distributed.engram_pool import EngramPool, verbs
 from vllm.distributed.engram_pool.group import PeerGroup
+from vllm.distributed.engram_pool.memory import gpu_numa_node
 from vllm.distributed.parallel_state import (
     get_engram_dp_group,
     get_engram_dp_size,
@@ -297,7 +298,21 @@ def _worker(rank: int, tp_size: int, port: int, store_dir: str) -> None:
 def _check_pool_tables(store_dir: str):
     """GPUs of independent engines split one table in an Engram pool and read
     each other's rows, over every transport this machine has."""
-    modes = [("nvlink", False, 4)] if imex_channel_available() else []
+    modes = []
+    if current_platform.is_cuda() and imex_channel_available():
+        from cuda.bindings import driver as cu
+
+        modes.append(("nvlink", False, 4))
+        # Every rank must take the same collective path in a mixed GPU group.
+        attrs = cu.CUdevice_attribute
+        egm_attr = (
+            attrs.CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+        )
+        if all(
+            cu.cuDeviceGetAttribute(egm_attr, device) == (cu.CUresult.CUDA_SUCCESS, 1)
+            for device in range(WORLD_SIZE)
+        ):
+            modes.append(("nvlink", True, 4))
     if verbs.active_devices():
         # GPUs of a node map each other's host shards; nodes of one use RDMA.
         modes += [("rdma", False, 4), ("rdma", True, 4), ("rdma", True, 1)]
@@ -316,6 +331,19 @@ def _check_pool_tables(store_dir: str):
                 sum(HEAD_SIZES), DIM, HEAD_SIZES, False, pool, "table"
             )
         assert table.dp_size == 1
+        if transport == "nvlink" and host:
+            error, handle = cu.cuMemRetainAllocationHandle(table.weight.data_ptr())
+            assert error == cu.CUresult.CUDA_SUCCESS
+            try:
+                error, prop = cu.cuMemGetAllocationPropertiesFromHandle(handle)
+                assert error == cu.CUresult.CUDA_SUCCESS
+                assert (
+                    prop.location.type
+                    == cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
+                )
+                assert prop.location.id == gpu_numa_node()
+            finally:
+                cu.cuMemRelease(handle)
         table.weight.weight_loader(table.weight, weight)
         table.weight_scale_inv.weight_loader(table.weight_scale_inv, scale)
         table.process_weights_after_loading()
