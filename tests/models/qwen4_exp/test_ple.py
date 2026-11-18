@@ -340,6 +340,47 @@ def test_ngram_embedding_loads_shards_and_ignores_legacy_token_lookup() -> None:
     )
 
 
+@pytest.mark.parametrize("case", ["complete", "missing", "duplicate", "peer_failure"])
+def test_pool_ple_requires_complete_unique_local_rows(case: str) -> None:
+    module = _make_ngram_embedding_for_load_test()
+    embedding = Qwen4ExpPLEPoolEmbedding.__new__(Qwen4ExpPLEPoolEmbedding)
+    nn.Module.__init__(embedding)
+    embedding.org_vocab_size = 8
+    embedding.shard_indices = module.ngram_embedding.shard_indices
+    embedding.weight = module.ngram_embedding.weight
+    embedding._loaded_ranges = []
+    embedding.table = SimpleNamespace(row_start=2, shard=embedding.weight)
+    ready = []
+    embedding.pool = SimpleNamespace(
+        group=SimpleNamespace(
+            all_gather=lambda status: [
+                status,
+                b"peer missing PLE rows" if case == "peer_failure" else b"",
+            ]
+        ),
+        ready=lambda table: ready.append(table),
+    )
+    module.ngram_embedding = embedding
+    shards = [
+        ("ngram_embedding.shard_0.weight", torch.zeros(4, 2)),
+        ("ngram_embedding.shard_1.weight", torch.ones(4, 2)),
+    ]
+    if case == "missing":
+        shards.pop()
+    elif case == "duplicate":
+        shards.append(shards[0])
+    module.load_weights(shards)
+    if case == "complete":
+        embedding.process_weights_after_loading()
+        assert ready == [embedding.table]
+        torch.testing.assert_close(embedding.weight[:2], torch.zeros(2, 2))
+        torch.testing.assert_close(embedding.weight[2:], torch.ones(2, 2))
+    else:
+        with pytest.raises(RuntimeError, match="checkpoint coverage failed"):
+            embedding.process_weights_after_loading()
+        assert not ready
+
+
 def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
     module = _make_fp8_ngram_embedding_for_load_test()
     shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
@@ -1223,6 +1264,7 @@ def _make_ple_from_checkpoint(
 
 def _check_nvlink_ple(rank: int, path: Path, store: str) -> None:
     torch.accelerator.set_device_index(rank)
+    path = path / f"rank-{rank}" / "model.safetensors"
     model_config = ModelConfig(
         model=str(path.parent), dtype="bfloat16", skip_tokenizer_init=True
     )
@@ -1327,13 +1369,18 @@ def test_nvlink_ple_checkpoint_shards_and_cuda_graph(tmp_path: Path) -> None:
         ple_layer_ids=[1],
     )
     text_config.ple_embedding_dtype = "float8_e4m3fn"
-    Qwen4ExpConfig(
+    config = Qwen4ExpConfig(
         text_config=text_config, architectures=["Qwen4ExpForConditionalGeneration"]
-    ).save_pretrained(tmp_path)
-    path = tmp_path / "model.safetensors"
+    )
+    for rank in range(2):
+        config.save_pretrained(tmp_path / f"rank-{rank}")
+    path = tmp_path / "rank-0" / "model.safetensors"
     _save_ple_checkpoint(path, "fp8", parts=3)
+    os.link(path, tmp_path / "rank-1" / "model.safetensors")
     torch.multiprocessing.spawn(
-        _check_nvlink_ple, args=(path, str(tmp_path / "peers")), nprocs=2
+        _check_nvlink_ple,
+        args=(tmp_path, str(tmp_path / "peers")),
+        nprocs=2,
     )
 
 
