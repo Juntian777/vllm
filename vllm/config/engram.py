@@ -3,7 +3,7 @@
 
 from typing import TYPE_CHECKING, Literal, Self
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from vllm.config.utils import CompileFactors, config, get_compile_factors
 
@@ -86,9 +86,10 @@ class EngramConfig:
     started before the decoder layers, each Engram layer waiting for its own
     rows; over RDMA the rows move without SMs in between. `async`: on a side
     stream beside the layers, so their SM work (all of NVLink's gather)
-    overlaps compute, at a CUDA graph break per fetch."""
+    overlaps compute. Full CUDA graphs capture both; piecewise ones break at
+    the start and at each Engram layer's wait."""
 
-    peer_group_rdma_inflight: int = 8
+    peer_group_rdma_inflight: int = Field(default=8, ge=0)
     """With `rdma`, the most prefill-sized gathers (64 WRs each) a GPU's NIC
     has in flight for its peers; 0 means no limit. Decode-sized fetches bypass
     it, so one engine's prefill delays another engine's decode by at most this
@@ -107,8 +108,6 @@ class EngramConfig:
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
             )
-        if self.peer_group_rdma_inflight < 0:
-            raise ValueError("peer_group_rdma_inflight must be >= 0")
         if (self.peer_group_size > 0) != (self.peer_group_store is not None):
             raise ValueError(
                 "peer_group_size and peer_group_store must be set together"

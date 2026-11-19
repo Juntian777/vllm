@@ -13,7 +13,6 @@ prefetch only their own tokens without DP gathers.
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
 from itertools import product
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -36,7 +35,6 @@ from vllm.config.scheduler import SchedulerConfig
 from vllm.distributed import cleanup_dist_env_and_memory, parallel_state
 from vllm.distributed.engram_pool import EngramPool, verbs
 from vllm.distributed.engram_pool.group import PeerGroup
-from vllm.distributed.engram_pool.memory import gpu_numa_node
 from vllm.distributed.parallel_state import (
     get_engram_dp_group,
     get_engram_dp_size,
@@ -348,7 +346,9 @@ def _check_pool_tables(store_dir: str):
                     prop.location.type
                     == cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
                 )
-                assert prop.location.id == gpu_numa_node()
+                assert prop.location.id == current_platform.get_device_numa_node(
+                    torch.accelerator.current_device_index()
+                )
             finally:
                 cu.cuMemRelease(handle)
         table.weight.weight_loader(table.weight, weight)
@@ -403,7 +403,7 @@ def test_engram_peer_group_assigns_ranks_and_gathers(tmp_path):
 
 def test_engram_peer_group_names_missing_gpus(tmp_path, monkeypatch):
     """A peer that never arrives fails startup with its rank, not a bare timeout."""
-    monkeypatch.setattr(PeerGroup, "TIMEOUT", timedelta(milliseconds=200))
+    monkeypatch.setenv("VLLM_ENGINE_READY_TIMEOUT_S", "1")
     group = PeerGroup(2, str(tmp_path / "peers"))
     with pytest.raises(TimeoutError, match=r"GPUs \[1\] did not reach startup step 1"):
         group.barrier()
@@ -1296,11 +1296,12 @@ def test_egm_startup_failure_propagates(monkeypatch, failure: str) -> None:
         def release(self, handle):
             self.released.append(handle)
 
-    def numa():
-        return -1 if failure == "numa" and local.rank == 0 else 0
+    def numa(device):
+        return None if failure == "numa" and local.rank == 0 else 0
 
     monkeypatch.setattr(nvlink, "CuMem", Memory)
-    monkeypatch.setattr(nvlink, "gpu_numa_node", numa)
+    monkeypatch.setattr(nvlink.current_platform, "get_device_numa_node", numa)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
         nvlink.torch,
         "tensor",

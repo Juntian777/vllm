@@ -5,8 +5,9 @@ a fetch is one kernel that loads each row from its owner's memory."""
 
 import torch
 
-from vllm.distributed.engram_pool.memory import CuMem, device_view, gpu_numa_node
+from vllm.distributed.engram_pool.memory import CuMem, device_view
 from vllm.distributed.engram_pool.rows import SHARD_BASES, locate
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -74,8 +75,10 @@ class NvlinkTransport:
             error = None
             exported_handle = b""
             try:
-                host_numa = gpu_numa_node()
-                if host_numa < 0:
+                host_numa = current_platform.get_device_numa_node(
+                    torch.accelerator.current_device_index()
+                )
+                if host_numa is None:
                     raise RuntimeError("CUDA host NUMA node is unavailable")
                 memory = CuMem(num_bytes, fabric=True, host_numa=host_numa)
                 exported_handle = memory.export_fabric()
